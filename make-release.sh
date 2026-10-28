@@ -29,7 +29,6 @@ grep -q '[^[:space:]]' "$notes" ||
 # propagate the version
 sed -i '' "s/^VERSION = \"[^\"]*\"/VERSION = \"$ver\"/" examples/transport.py
 sed -i '' "s/^version = \"[^\"]*\"/version = \"$ver\"/" blender/nomad_blender_link/blender_manifest.toml
-sed -i '' "s/BRIDGE_VERSION = \"[^\"]*\"/BRIDGE_VERSION = \"$ver\"/g" ../../src/link/LinkProtocol.hpp
 cp examples/transport.py houdini/python/nomad_link/
 cp examples/transport.py toolbag/NomadLink/
 

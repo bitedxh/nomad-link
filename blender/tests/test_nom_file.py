@@ -389,6 +389,43 @@ def test_scene_tree():
     check(True, "every scene tree is flattened parents-first")
 
 
+def test_writer_roundtrip():
+    writer = nom_file.NomWriter()
+    positions = numpy.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [2, 0, 0]], "<f4")
+    faces = numpy.array([[0, 1, 2, 3], [1, 4, 2, -1]], "<i4")
+    groups = numpy.array([3, 0x8001], "<u2")
+    mesh = {"mesh_type": "mesh", "material": -1, "count_vertex": 5, "count_face": 2, "count_uv": 0}
+    writer.array(mesh, "vertices", "f32vec3", positions)
+    writer.array(mesh, "faces", "i32vec4", faces)
+    writer.array(mesh, "faces_group", "u16", groups)
+    writer.array(mesh, "roughness", "u8", numpy.array([0, 64, 128, 192, 255], "u1"))
+    writer.json["meshes"].append(mesh)
+    writer.json["scene"].append({"name": "Written", "mesh": 0, "children": []})
+    image = writer.blob(b"\x89PNG odd length")
+    writer.save(TMP)
+
+    nom = nom_file.NomFile(TMP)
+    raw = open(TMP, "rb").read()
+    check(nom.version == nom_file.VERSION and nom.thumbnail is None, "header: version, no thumbnail")
+    check(struct.unpack_from("<Q", raw, 16)[0] == len(raw), "header: file size")
+    check(struct.unpack_from("<Q", raw, 40)[0] % 4 == 0, "header: binary block 4-byte aligned")
+    entries = nom.json["meshes"][0]
+    check(all(entries[name]["offset"] % 4 == 0 for name in ("vertices", "faces", "faces_group", "roughness")),
+          "every array starts 4-byte aligned")
+    check(entries["roughness"]["length"] == 5, "length is the unpadded byte count")
+    geometry = nom_file.geometry(nom, 0)
+    check(numpy.array_equal(geometry.vertices, positions), "vertices round-trip")
+    check(numpy.array_equal(geometry.faces, faces), "faces round-trip, triangle w < 0 kept")
+    check(numpy.array_equal(geometry.faces_group[:, 0], groups), "face meta round-trip")
+    check(nom_file.blob(nom, image) == b"\x89PNG odd length", "raw blob round-trip")
+    try:
+        writer.array({}, "faces", "i32vec4", positions)
+        check(False, "a component mismatch must raise")
+    except ValueError:
+        check(True, "a component mismatch raises")
+    os.remove(TMP)
+
+
 if __name__ == "__main__":
     for name, function in sorted(globals().items()):
         if name.startswith("test_"):

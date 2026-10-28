@@ -29,6 +29,8 @@ Painting layers are flattened to their visible PBR result. Sculpt offset layers 
 
 Linked meshes keep a persistent link ID. Topology-changing edits, remesh operations, and primitive edits replace the linked geometry instead of creating duplicates.
 
+Without a link, **File → Import → Nomad Sculpt (.nom)** opens a Nomad file (dropping one on the 3D viewport works too), and **File → Export → Nomad Sculpt (.nom)** saves the meshes, lights and camera objects as one. The export writes the same data the link sends, plus the hierarchy and the 3D viewport as Nomad's camera. N-gons are triangulated, and **Apply Modifiers** trades a mesh's shape keys for its modifier result.
+
 Nomad-generated materials occupy their own Blender material slot. A custom Blender shader is left alone if the generated material has been removed; enable material sync only when shader translation is wanted.
 
 The wire protocol is versioned independently of Nomad, so ordinary Nomad releases do not require an extension update. If the package is installed from a Blender extension repository, a handshake can automatically install the required compatible version from that same repository. A ZIP-only installation has no remote update source and therefore keeps running until the protocol minimum changes.

@@ -116,7 +116,6 @@ Nomad's `hello` reply:
     "type": "hello",
     "protocol": 1,
     "nomad_version": "2.x",
-    "bridge_version": "...",
     "minimum_bridge_version": "...",
     "capabilities": ["..."],
     "pair_token": "<present only when Nomad approves a new pairing>"
@@ -227,6 +226,7 @@ Complete mesh state in one frame.
     "child_index": 2,                     //   the matrix pair, exactly as in object_state
     "pivot_delta": [ /* 16 floats */ ],   // node-local pivot, shared by the geometry group;
                                           //   repeat randomness turns around it. Absent = leave as-is
+    "repeat": true,                       // optional: a procedural copy sent back (§8)
     "smooth_shading": true,               // ⭐
     "visible": true,                      // absent = leave as-is (new objects visible)
     "locked": false,                      // object lock (read-only content), absent = leave as-is
@@ -506,6 +506,11 @@ already uses other geometry, reassign it.
 The sender owns a `repeat` instance: the receiver applies every update but never
 sends geometry, transform, or deletion under its `mesh_id`. Edits to the shared
 geometry travel under the geometry owner's `mesh_id` instead.
+
+The one exception is a Selection or Scene transfer, which sends what is visible: each copy
+follows its owner, as a `mesh_instance` or a `mesh_full` flagged `"repeat": true` with its
+`parent_id`. A peer still holding the repeater drops it (§10.4); any other peer, such as a
+fresh scene, gets an ordinary object.
 
 If `geometry_id` is unknown, send `error` and
 `{"type": "request_mesh", "link_id": <mesh_id>}`. The peer must reply with
@@ -999,7 +1004,8 @@ config-only round trip loses exactly what a save and reload loses.
 
 - `protocol` (int): breaking changes only. Disconnect on mismatch.
 - Ignore unknown fields and message types. Use capabilities for new behavior.
-- `bridge_version` and `minimum_bridge_version` are for the reference client's updater.
+- `minimum_bridge_version` is the oldest bridge this Nomad accepts: the reference client updates
+  itself when it is older. A client's own `bridge_version` is informational.
 
 ## 12. Minimum implementation
 

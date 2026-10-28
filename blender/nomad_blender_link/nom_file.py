@@ -1,8 +1,8 @@
 # Nomad Blender Link
 # Copyright (C) 2024-2026 Hexanomad
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Reader for Nomad Sculpt .nom files. Deliberately free of bpy so it runs (and is
-testable) outside Blender: everything here turns a file into numpy arrays."""
+"""Reader and writer for Nomad Sculpt .nom files. Deliberately free of bpy so it runs (and
+is testable) outside Blender: everything here maps between a file and numpy arrays."""
 
 import ctypes
 import ctypes.util
@@ -16,6 +16,8 @@ import numpy
 
 MAGIC = b"Nomad Sculpt"
 MAGIC_LEGACY = 0x6D26A524
+VERSION = 7  # SaveNomad's s_version: below it, the loader runs legacy fixes on the file
+HEADER = 72
 CHUNK = 1024 * 1024  # writer splits arrays into independently compressed blocks
 
 # name -> (numpy dtype, components). The stored "type" string is checked against this.
@@ -563,6 +565,46 @@ def environment(nom):
             if data:
                 return str(asset.get("name") or "Nomad Environment"), data
     return None
+
+
+# ---------------------------------------------------------------------- writing
+
+class NomWriter:
+    """Builds a .nom: the scene json plus one blob. Arrays go in raw (lz4 false), which
+    the loader takes as-is and compresses on its next save, so no LZ4 encoder is needed."""
+
+    def __init__(self):
+        self.json = {"scene": [], "meshes": [], "materials": []}
+        self._bin = bytearray()
+
+    def blob(self, data):
+        """{offset, length} of `data` appended to the blob, 4-byte aligned like Memory::align."""
+        found = {"offset": len(self._bin), "length": len(data)}
+        self._bin += data
+        self._bin += bytes(-len(self._bin) % 4)
+        return found
+
+    def array(self, node, name, kind, values):
+        """values as node[name], one row per element, in the TYPES layout of `kind`."""
+        dtype, components = TYPES[kind]
+        values = numpy.ascontiguousarray(values, dtype)
+        count = len(values)
+        if values.size != count * components:
+            raise ValueError(f"{name}: expected {components} components per {kind}")
+        node[name] = {"count": count, "type": kind, "lz4": False, **self.blob(values.tobytes())}
+
+    def save(self, path):
+        document = json.dumps(self.json, separators=(",", ":")).encode()
+        json_size = len(document)
+        document += b" " * (-json_size % 4)  # SaveNomad pads with spaces too
+        bin_offset = HEADER + len(document)
+        size = bin_offset + len(self._bin)
+        # no thumbnail: a zero size is how readers know to skip it
+        header = MAGIC + struct.pack("<I7Q", VERSION, size, HEADER, json_size, bin_offset, len(self._bin), 0, 0)
+        with open(path, "wb") as handle:
+            handle.write(header)
+            handle.write(document)
+            handle.write(self._bin)
 
 
 if __name__ == "__main__":

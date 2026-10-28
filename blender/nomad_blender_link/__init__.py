@@ -15,6 +15,7 @@ import numpy
 import bpy
 import bmesh
 from bpy.app.handlers import persistent
+from bpy_extras.io_utils import ExportHelper
 from mathutils import Matrix, Vector
 
 from . import nom_file
@@ -1658,13 +1659,26 @@ def texture_sample_node(texture_node):
     return None
 
 
-def material_textures(shader):
-    """The texture channels Blender models, as blob references; queues unsent blobs.
+def wire_texture(image, data, name):
+    texture_id = ensure_texture_id(image)
+    if texture_id not in sent_textures:
+        # the blob rides the same ordered queue, ahead of the message referencing it
+        connection.send(
+            {"type": "texture", "texture_id": texture_id, "name": name, "binary_size": len(data)},
+            data,
+        )
+        sent_textures.add(texture_id)
+    return {"texture_id": texture_id, "name": name}
+
+
+def material_textures(shader, store=None):
+    """The texture channels Blender models, as blob references; `store` turns an image into
+    one, by default queuing unsent blobs on the wire.
 
     A channel without an image sends the explicit {} clear; channels Blender cannot
     represent (occlusion, displacement) stay absent so Nomad keeps them.
     """
-    if shader is None or "texture" not in remote_capabilities:
+    if shader is None or (store is None and "texture" not in remote_capabilities):
         return None, None
     color_image = linked_image(shader, "Base Color")
     alpha_images = linked_images(shader, "Alpha")
@@ -1692,15 +1706,7 @@ def material_textures(shader):
         if data is None:
             textures[channel] = {}  # no image (or nothing shareable): explicit clear
             continue
-        texture_id = ensure_texture_id(image)
-        if texture_id not in sent_textures:
-            # the blob rides the same ordered queue, ahead of the message referencing it
-            connection.send(
-                {"type": "texture", "texture_id": texture_id, "name": name, "binary_size": len(data)},
-                data,
-            )
-            sent_textures.add(texture_id)
-        entry = {"texture_id": texture_id, "name": name}
+        entry = (store or wire_texture)(image, data, name)
         exact_triplanar = bool(image_node.get("nomad_triplanar"))
         if exact_triplanar:
             entry["projection"] = "triplanar"
@@ -1749,7 +1755,7 @@ def material_textures(shader):
     return textures, use_color_opacity
 
 
-def material_settings(obj, has_color, has_roughness, has_metalness):
+def material_settings(obj, has_color, has_roughness, has_metalness, store=None):
     material, shader = active_principled(obj)
     color = tuple(material.diffuse_color[:3]) if material else (1.0, 1.0, 1.0)
     opacity = float(material.diffuse_color[3]) if material else 1.0
@@ -1774,7 +1780,7 @@ def material_settings(obj, has_color, has_roughness, has_metalness):
         # a bare _value (no _auto) is an explicit set; Blender always has a definite answer
         "smooth_shading_value": any(polygon.use_smooth for polygon in obj.data.polygons),
     }
-    textures, use_color_opacity = material_textures(shader)
+    textures, use_color_opacity = material_textures(shader, store)
     if textures is not None:
         settings["textures"] = textures
         settings["use_color_opacity_value"] = use_color_opacity
@@ -2135,6 +2141,9 @@ def send_object(obj, live=False, replace_topology=False, geometry_changed=False)
         include_material=not live or bpy.context.scene.nomad_link_sync_materials,
         replace_topology=replace_topology,
     )
+    if obj.get(REPEAT_TAG):
+        # the peer tells its own copies by the parent chain, which a full mesh otherwise omits
+        header.update(repeat=True, parent_id=object_state(obj)["parent_id"])
     connection.send(header, binary)
 
 
@@ -2242,6 +2251,7 @@ def object_state(obj):
         # "" is the root; child_index is advisory and Blender has no sibling order to report
         "parent_id": parent_id,
         "world_matrix": matrix_to_columns(matrix),
+        **({"repeat": True} if obj.get(REPEAT_TAG) else {}),
     }
 
 
@@ -2306,15 +2316,12 @@ NOMAD_LIGHT_TYPES = {"SUN": "directional", "POINT": "point", "SPOT": "spot"}
 BLENDER_LIGHT_TYPES = {"directional": "SUN", "point": "POINT", "spot": "SPOT"}
 
 
-def send_light(obj, live=False):
+def light_settings(obj):
     data = obj.data
     light_type = NOMAD_LIGHT_TYPES.get(data.type, "point")
     if obj.get("nomad_light_type") == "environment":
         light_type = "environment"
     header = {
-        "type": "light",
-        "live_sync": live,
-        **object_state(obj),
         "light_type": light_type,
         "color": tuple(data.color),
         "shadow_cast": data.use_shadow,
@@ -2338,22 +2345,25 @@ def send_light(obj, live=False):
         header["color"] = tuple(t * b for t, b in zip(data.color, kelvin_to_rgb(data.temperature)))
     elif data.use_temperature:
         del header["color"]  # white tint carries no information, let Nomad keep its color
-    connection.send(header)
+    return header
+
+
+def send_light(obj, live=False):
+    connection.send({"type": "light", "live_sync": live, **object_state(obj), **light_settings(obj)})
+
+
+def camera_settings(obj):
+    data = obj.data
+    world = authored_world(obj)  # authored: see object_state
+    return {
+        "orthographic": data.type == "ORTHO",
+        "fov_y": math.degrees(data.angle_y),
+        "pivot": list((TO_NOMAD @ (world.translation - world.col[2].xyz * 5.0).to_4d()).to_3d()),
+    }
 
 
 def send_camera_object(obj, live=False):
-    data = obj.data
-    world = authored_world(obj)  # authored: see object_state
-    connection.send(
-        {
-            "type": "camera_object",
-            "live_sync": live,
-            **object_state(obj),
-            "orthographic": data.type == "ORTHO",
-            "fov_y": math.degrees(data.angle_y),
-            "pivot": list((TO_NOMAD @ (world.translation - world.col[2].xyz * 5.0).to_4d()).to_3d()),
-        }
-    )
+    connection.send({"type": "camera_object", "live_sync": live, **object_state(obj), **camera_settings(obj)})
 
 
 def send_supported(obj, live=False, replace_topology=False):
@@ -2373,12 +2383,12 @@ def scope_objects(scene, scope):
     for obj in pool:
         if not supported_object(obj):
             continue
-        if obj.get(REPEAT_TAG):  # a repeat copy stands in for its owner
-            obj = repeat_owner(obj)
-            if obj is None:
-                continue
-        if obj not in objects:
-            objects.append(obj)
+        # a repeat copy's edits belong to its owner, sent first; the copy follows flagged, and
+        # only a peer without its repeater materializes it (PROTOCOL §10.4)
+        owner = repeat_owner(obj) if obj.get(REPEAT_TAG) else None
+        for item in (owner, obj):
+            if item is not None and item not in objects:
+                objects.append(item)
     return objects
 
 
@@ -3057,7 +3067,7 @@ def receive_packet(header, binary):
     elif message_type in {"request_active_mesh", "request_mesh", "request_selection"}:
         target = find_linked_object(header.get("link_id", ""))
         if target is not None and target.get(REPEAT_TAG):
-            target = repeat_owner(target)  # the copy's geometry lives on its owner
+            target = repeat_owner(target) or target  # the copy's geometry lives on its owner, if any
         if target is not None:
             force_full_ids.add(target[MESH_ID])
             if target.as_pointer() not in pending_transfers:
@@ -4022,20 +4032,20 @@ def place_imported(collection, obj, parent, target):
     """Parent obj and give it the world `target` exactly. Blender objects author only
     loc/rot/scale, so a skewed target gets a nomad_unskew parent empty holding the clean
     part while the skew residue rides matrix_parent_inverse, the one slot that keeps it."""
-    clean = Matrix.LocRotScale(*target.decompose())
     scale = max(1.0, max(abs(value) for row in target for value in row))
-    if all(abs(clean[i][j] - target[i][j]) < 1e-4 * scale for i in range(4) for j in range(4)):
-        obj.matrix_world = target
+    # judged on Blender's own decomposition: it can drift further than mathutils' decompose()
+    obj.matrix_world = target
+    if all(abs(obj.matrix_basis[i][j] - target[i][j]) < 1e-4 * scale for i in range(4) for j in range(4)):
         set_parent_keep_world(obj, parent)
         return
     empty = bpy.data.objects.new("nomad_unskew", None)
     empty.empty_display_size = 0.1
     collection.objects.link(empty)
-    empty.matrix_world = clean
+    empty.matrix_world = Matrix.LocRotScale(*target.decompose())
     set_parent_keep_world(empty, parent)
     obj.parent = empty
     obj.parent_type = "OBJECT"
-    obj.matrix_parent_inverse = clean.inverted_safe() @ target
+    obj.matrix_parent_inverse = authored_world(empty).inverted_safe() @ target
     obj.matrix_basis = Matrix.Identity(4)
 
 
@@ -4224,6 +4234,280 @@ def menu_import_nom(self, _context):
     self.layout.operator(NOMAD_OT_import_nom.bl_idname, text="Nomad Sculpt (.nom)")
 
 
+NOM_IMAGE_TYPE = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                  ".hdr": "image/vnd.radiance", ".exr": "image/x-exr"}
+
+
+def export_nom_material(writer, settings, smooth):
+    """A .nom material entry from the wire's material settings: the same keys, except the
+    textures, whose sampler keys go camelCase and whose factors move onto the material."""
+    entry = {key: settings[key] for key in ("color", "opacity", "roughness", "metalness", "material_type",
+                                           "refraction_ior", "subsurface_depth")}
+    entry["version"] = 1
+    entry["smooth_shading"] = int(smooth)
+    if "use_color_opacity_value" in settings:
+        entry["use_color_opacity"] = int(settings["use_color_opacity_value"])
+    textures = {}
+    for channel, source in (settings.get("textures") or {}).items():
+        if not source:
+            continue
+        jtex = {"name": source["name"], "index": source["index"],
+                "projection": source.get("projection", "uv"),
+                "wrapS": source.get("wrap_s", "repeat"), "wrapT": source.get("wrap_t", "repeat"),
+                "minFilter": source.get("min_filter", "auto"), "magFilter": source.get("mag_filter", "auto")}
+        for key in ("offset", "scale", "rotation", "triplanar_hardness", "triplanar_world"):
+            if key in source:
+                jtex[key] = source[key]
+        if "factor" in source:
+            entry[NOM_CHANNEL_FACTORS[channel]] = source["factor"]
+        if channel == "normal":
+            entry["normal_neg_y"] = bool(source.get("neg_y", False))
+        textures[channel] = jtex
+    if textures:
+        entry["textures"] = textures
+    writer.json["materials"].append(entry)
+    return len(writer.json["materials"]) - 1
+
+
+def export_nom_mesh(writer, obj, mesh, store):
+    """One meshes[] entry, the file's counterpart of encode_mesh. The file holds triangles and
+    quads only, so n-gons go in as Blender's own triangulation of them."""
+    loop_totals = foreach_get(mesh.polygons, "loop_total", dtype=numpy.int32)
+    if loop_totals.size and loop_totals.min() < 3:
+        raise ValueError(f"{obj.name}: faces need at least 3 corners")
+    loop_starts = foreach_get(mesh.polygons, "loop_start", dtype=numpy.int32)
+    corner_verts = foreach_get(mesh.loops, "vertex_index", dtype=numpy.int32)
+    small = loop_totals <= 4
+    quad = loop_totals[small] == 4
+    face_index = numpy.flatnonzero(small)
+    triangles = numpy.empty((0, 3), numpy.int32)
+    if not small.all():
+        polygon = foreach_get(mesh.loop_triangles, "polygon_index", dtype=numpy.int32)
+        triangles = foreach_get(mesh.loop_triangles, "loops", 3, dtype=numpy.int32)[~small[polygon]]
+        face_index = numpy.concatenate((face_index, polygon[~small[polygon]]))
+
+    def face_table(corners):
+        table = numpy.full((len(face_index), 4), -1, "<i4")
+        table[:len(quad)] = corner_table(loop_starts[small], quad, corners)
+        table[len(quad):, :3] = corners[triangles]
+        return table
+
+    entry = {"mesh_type": "mesh", "count_vertex": len(mesh.vertices), "count_face": len(face_index), "count_uv": 0}
+
+    # the file stores composed positions: every visible layer is already added in
+    shape_keys = mesh.shape_keys.key_blocks if mesh.shape_keys else ()
+    basis = foreach_get(shape_keys[0].data if shape_keys else mesh.vertices, "co", 3)
+    positions = basis.astype(numpy.float64)
+    layers = []
+    for key in shape_keys[1:]:
+        offsets = foreach_get(key.data, "co", 3) - basis
+        if not key.mute:
+            positions += key.value * offsets
+        factor = min(abs(key.value), 1.0)
+        layer = {"name": key.name, "visible": not key.mute, "visible_offset": True, "factor": factor,
+                 "factor_offset": key.value / factor if factor > 0.0 else 1.0}
+        writer.array(layer, "offsets", "f32vec3", to_nomad_vectors(offsets))
+        layers.append(layer)
+    if layers:
+        entry["layers"] = layers
+        entry["active_layer"] = obj.active_shape_key_index - 1
+    writer.array(entry, "vertices", "f32vec3", to_nomad_vectors(positions))
+    writer.array(entry, "faces", "i32vec4", face_table(corner_verts))
+
+    uv_layer = mesh.uv_layers.active
+    if uv_layer:
+        uv_values = foreach_get(uv_layer.data, "uv", 2)
+        uv_values[:, 1] = 1.0 - uv_values[:, 1]
+        _, first, corner_uvs = numpy.unique(uv_values.view(numpy.int64).ravel(),
+                                            return_index=True, return_inverse=True)
+        entry["count_uv"] = len(first)
+        writer.array(entry, "uvs", "f32vec2", uv_values[first])
+        writer.array(entry, "faces_uv", "i32vec4", face_table(corner_uvs.reshape(-1).astype(numpy.int32)))
+
+    colors, roughness, metalness = paint_channels(mesh)
+    if colors is not None:
+        writer.array(entry, "colors", "u8rgbm", encode_rgbm(colors[:, :3]))
+        writer.array(entry, "opacity", "u8", pack_unit(colors[:, 3], 255.0, "u1"))
+    if roughness is not None:
+        writer.array(entry, "roughness", "u8", pack_unit(roughness, 255.0, "u1"))
+    if metalness is not None:
+        writer.array(entry, "metalness", "u8", pack_unit(metalness, 255.0, "u1"))
+    mask = sculpt_mask(mesh)
+    if mask is not None:
+        writer.array(entry, "masks", "u16", pack_unit(1.0 - mask, 65535.0, "<u2"))
+
+    groups = face_groups(mesh)
+    hidden = hidden_faces(mesh)
+    if groups is not None or hidden is not None:
+        # FaceMeta: group in bits 0-14, the hidden-face DISCARD flag in bit 15
+        meta = numpy.zeros(len(mesh.polygons), "<u2")
+        if groups is not None:
+            meta |= groups.astype("<u2")
+        if hidden is not None:
+            meta |= hidden.astype("<u2") << 15
+        writer.array(entry, "faces_group", "u16", meta[face_index])
+    try:
+        names = json.loads(obj.data.get("nomad_face_groups", "[]"))
+    except (TypeError, ValueError):
+        names = []
+    if names:
+        entry["groups"] = names
+
+    settings = material_settings(obj, colors is not None, roughness is not None, metalness is not None, store)
+    entry["material"] = export_nom_material(writer, settings,
+                                            foreach_get(mesh.polygons, "use_smooth", dtype=bool).any())
+    writer.json["meshes"].append(entry)
+    return len(writer.json["meshes"]) - 1
+
+
+def export_nom_view(writer, root, objects):
+    """The 3D viewport as Nomad's camera, or a front view framing `objects` without one."""
+    viewport = find_view3d()
+    if viewport is not None:
+        view = viewport[0].region_3d
+        world_from_view = view.view_matrix.inverted()
+        rotation = (TO_NOMAD.to_3x3() @ world_from_view.to_3x3()).to_quaternion().conjugated()
+        eye = root @ TO_NOMAD @ world_from_view.translation
+        pivot = root @ TO_NOMAD @ view.view_location
+    else:
+        corners = [root @ TO_NOMAD @ obj.matrix_world @ Vector(corner) for obj in objects for corner in obj.bound_box]
+        low = Vector([min(corner[i] for corner in corners) for i in range(3)]) if corners else Vector()
+        high = Vector([max(corner[i] for corner in corners) for i in range(3)]) if corners else Vector()
+        rotation = Matrix.Identity(3).to_quaternion()
+        pivot = (low + high) / 2.0
+        eye = pivot + Vector((0.0, 0.0, max((high - low).length, 1e-3) * 1.5))
+    writer.json["settings"] = {
+        "camera_translation": list(rotation @ (eye - pivot)),
+        "camera_rotation": [rotation.x, rotation.y, rotation.z, rotation.w],
+        "camera_pivot": list(pivot),
+    }
+
+
+def export_nom(context, path, selection=False, modifiers=True, scale=1.0, lights=True):
+    """Write the meshes (and lights and cameras) to a .nom, their other ancestors as groups so
+    the hierarchy and transforms survive. Returns (objects, skipped)."""
+    writer = nom_file.NomWriter()
+    images = {}
+    image_names = set()
+
+    def store(image, data, name):
+        # the loader extracts each texture by name: two different images must never share one
+        if image.as_pointer() not in images:
+            stem, suffix = os.path.splitext(name)
+            unique = name
+            while unique in image_names:
+                unique = f"{stem}.{len(image_names)}{suffix}"
+            image_names.add(unique)
+            writer.json.setdefault("images", []).append(
+                {"type": NOM_IMAGE_TYPE.get(suffix.lower(), "image/png"), **writer.blob(data)})
+            images[image.as_pointer()] = (len(writer.json["images"]) - 1, unique)
+        index, unique = images[image.as_pointer()]
+        return {"index": index, "name": unique}
+
+    candidates = list(context.selected_objects if selection else context.scene.objects)
+    meshes = [obj for obj in candidates if obj.type == "MESH"]
+    exported = set(meshes).union(obj for obj in candidates if lights and obj.type in {"LIGHT", "CAMERA"})
+    kept = set()
+    for obj in exported:
+        while obj is not None and obj not in kept:
+            kept.add(obj)
+            obj = obj.parent
+    skipped = sum(obj not in kept and obj.type != "EMPTY" for obj in candidates)
+
+    depsgraph = context.evaluated_depsgraph_get()
+    root = Matrix.Scale(scale, 4)
+    shared = {}  # (mesh, material) -> meshes[] index: linked duplicates stay instances
+
+    def mesh_index(obj):
+        evaluated = modifiers and any(modifier.show_viewport for modifier in obj.modifiers)
+        material = obj.active_material.as_pointer() if obj.active_material else 0
+        key = None if evaluated or obj.mode == "EDIT" else (obj.data.as_pointer(), material)
+        if key in shared:
+            return shared[key]
+        if evaluated:
+            source = obj.evaluated_get(depsgraph)
+            try:
+                index = export_nom_mesh(writer, obj, source.to_mesh() or obj.data, store)
+            finally:
+                source.to_mesh_clear()
+        else:
+            index = export_nom_mesh(writer, obj, editmode_mesh(obj) if obj.mode == "EDIT" else obj.data, store)
+        if key is not None:
+            shared[key] = index
+        return index
+
+    def node(obj, parent_world):
+        # meshes conjugate because their vertices are swizzled, as in import_nom
+        world = root @ TO_NOMAD @ obj.matrix_world @ (TO_BLENDER if obj.type == "MESH" else Matrix.Identity(4))
+        entry = {"name": obj.name, "matrix": matrix_to_columns(parent_world.inverted_safe() @ world),
+                 "selected": obj.select_get(), "selected_main": obj == context.view_layer.objects.active}
+        if obj in exported:
+            # a hidden Nomad node hides its whole subtree, so groups stay visible
+            entry["visible"] = obj.visible_get()
+        if obj.type == "MESH":
+            entry["mesh"] = mesh_index(obj)
+        elif obj in exported and obj.type == "LIGHT":
+            # the file's light keys are the wire's, but for the type
+            light = light_settings(obj)
+            light["type"] = light.pop("light_type")
+            writer.json.setdefault("lights", []).append(light)
+            entry["light"] = len(writer.json["lights"]) - 1
+        elif obj in exported:
+            camera = camera_settings(obj)
+            writer.json.setdefault("cameras", []).append(
+                {"orthographic": camera["orthographic"], "fovy": camera["fov_y"],
+                 "pivot": list(root @ Vector(camera["pivot"]))})
+            entry["camera"] = len(writer.json["cameras"]) - 1
+        children = sorted((child for child in obj.children if child in kept), key=lambda child: child.name)
+        entry["children"] = [node(child, world) for child in children]
+        return entry
+
+    roots = sorted((obj for obj in kept if obj.parent is None), key=lambda obj: obj.name)
+    writer.json["scene"] = [node(obj, root) for obj in roots]
+    export_nom_view(writer, root, meshes)
+    writer.save(path)
+    return len(exported), skipped
+
+
+class NOMAD_OT_export_nom(bpy.types.Operator, ExportHelper):
+    bl_idname = "nomad.export_nom"
+    bl_label = "Export Nomad Sculpt"
+    bl_description = "Save the meshes, lights and cameras as a Nomad Sculpt .nom file"
+
+    filename_ext = ".nom"
+    filter_glob: bpy.props.StringProperty(default="*.nom", options={"HIDDEN"})
+
+    use_selection: bpy.props.BoolProperty(
+        name="Selected Only", default=False,
+        description="Export the selected objects only")
+    use_modifiers: bpy.props.BoolProperty(
+        name="Apply Modifiers", default=True,
+        description="Export the result of the modifier stacks; meshes with modifiers lose their "
+                    "shape keys, which otherwise become sculpt layers")
+    use_lights: bpy.props.BoolProperty(
+        name="Lights & Cameras", default=True,
+        description="Export the lights and camera objects too")
+    scale: bpy.props.FloatProperty(
+        name="Scale", default=1.0, min=0.0001, soft_max=100.0,
+        description="Uniform scale applied to the exported objects")
+
+    def execute(self, context):
+        try:
+            count, skipped = export_nom(context, self.filepath, selection=self.use_selection,
+                                        modifiers=self.use_modifiers, scale=self.scale,
+                                        lights=self.use_lights)
+        except (OSError, ValueError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        note = f", {skipped} unsupported skipped" if skipped else ""
+        self.report({"INFO"}, f"Exported {count} objects to {os.path.basename(self.filepath)}{note}")
+        return {"FINISHED"}
+
+
+def menu_export_nom(self, _context):
+    self.layout.operator(NOMAD_OT_export_nom.bl_idname, text="Nomad Sculpt (.nom)")
+
+
 classes = (
     NomadLinkPreferences,
     NOMAD_OT_forget_pairing,
@@ -4240,6 +4524,7 @@ classes = (
     NOMAD_OT_update,
     NOMAD_OT_import_nom,
     NOMAD_FH_import_nom,
+    NOMAD_OT_export_nom,
     NOMAD_PT_link,
 )
 
@@ -4249,6 +4534,7 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_import_nom)
+    bpy.types.TOPBAR_MT_file_export.append(menu_export_nom)
     bpy.types.Scene.nomad_link_camera_target = bpy.props.EnumProperty(
         name="View Target",
         items=(
@@ -4314,6 +4600,7 @@ def register():
 
 def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_import_nom)
+    bpy.types.TOPBAR_MT_file_export.remove(menu_export_nom)
     connection.disconnect()
     if activity_watch_operator is not None:
         activity_watch_operator.cancel(bpy.context)

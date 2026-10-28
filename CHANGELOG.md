@@ -2,6 +2,22 @@
 
 Every release publishes the section named after its version as the release notes.
 
+## 0.11.47
+
+- Blender: **File → Export → Nomad Sculpt (.nom)** saves the scene as a Nomad file, without
+  a running link. It writes the hierarchy, linked duplicates as instances, UVs, vertex paint,
+  the sculpt mask, face groups, hidden faces, shape keys as sculpt layers, the material with
+  its textures, lights and camera objects, the selection, and the 3D viewport as Nomad's
+  camera. N-gons are triangulated.
+- Blender: a .nom import keeps a slightly skewed transform exact. Blender's own decomposition
+  used to round it off by up to 1e-3.
+- Blender: a Scene or Selection send keeps the copies Nomad's repeaters made (#3). Each copy
+  follows its owner, flagged `repeat`: a Nomad still holding the repeater ignores it, and a
+  fresh scene gets it as an ordinary object. A copy with its own mesh used to be dropped, and
+  every copy went missing in a Nomad without the repeater.
+- Nomad's `hello` no longer carries `bridge_version`. No bridge read it, so the protocol
+  version stays 1.
+
 ## 0.11.46
 
 - The `displacement` texture channel carries `mid` and `world` beside its `factor`, and the
