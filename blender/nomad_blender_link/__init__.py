@@ -85,6 +85,10 @@ force_full_ids = set()
 sent_geometry = set()
 delta_cache = {}
 deferred_parents = {}  # link_id -> parent link_id whose object has not arrived yet (PROTOCOL §9)
+# link ids created by the receive in progress whose parent has not arrived yet. They still
+# take that parent once, even when Keep Blender Placement is on: a new object has no
+# Blender placement to keep, and skipping the remote parent left it at the world origin
+fresh_links = set()
 deferred_packets = []  # scene packets held while a modal operator runs, applied in order after it
 deferred_camera = None  # the newest view held with them: older ones are stale by then
 undo_pending = False  # a drained packet changed blend data: poll pushes one undo step for it
@@ -341,11 +345,44 @@ def resolve_deferred_parents():
                 deferred_parents.pop(link_id, None)
             continue
         deferred_parents.pop(link_id, None)
-        set_parent_keep_world(obj, parent)
+        fresh = link_id in fresh_links
+        fresh_links.discard(link_id)
+        # a parent that shows up later still claims a brand-new child; an object that
+        # already had a Blender placement keeps it, parents included
+        if fresh or not preserve_blender_frame(obj):
+            set_parent_keep_world(obj, parent)
 
 
-def apply_object_transform(obj, header):
+def preserve_blender_frame(obj):
+    """True when this object, or anything under it, is authored in Blender.
+
+    Ancestors are included on purpose: a remote group transform would otherwise
+    carry a protected mesh along even though that mesh ignores its own matrix.
+    """
+    return bool(getattr(obj, "nomad_link_preserve_transform", False)) or any(
+        getattr(child, "nomad_link_preserve_transform", False) for child in obj.children_recursive
+    )
+
+
+def outgoing_world(obj):
+    """World matrix to send. Protected objects send the evaluated one, so a Child Of
+    or a bone parent leaves Nomad where Blender is showing the object. Everything else
+    sends the authored basis: matrix_world lags a transform applied earlier in this
+    same packet, and echoing that lag snaps the peer to the identity."""
+    if preserve_blender_frame(obj):
+        return obj.matrix_world.copy()
+    return authored_world(obj)
+
+
+def apply_object_transform(obj, header, fresh=False):
+    # fresh: this receive just created the object. It has no Blender placement yet, so
+    # the remote matrix and parent are its placement. Skipping them leaves it at the origin.
+    if not fresh and preserve_blender_frame(obj):
+        deferred_parents.pop(obj.get(MESH_ID, ""), None)
+        return
     parent = hierarchy_parent(obj, header)
+    if fresh and obj.get(MESH_ID, "") in deferred_parents:
+        fresh_links.add(obj.get(MESH_ID, ""))
     if parent is not KEEP_PARENT:
         set_parent_keep_world(obj, parent)
     # Lights and cameras aim along their local -Z in both applications, so their frames
@@ -1082,6 +1119,7 @@ def receive_mesh(header, binary):
 
     mesh_id = header["mesh_id"]
     obj = find_linked_object(mesh_id)
+    created = obj is None
     if obj is not None and sends_evaluated(obj):
         connection.error = MODIFIER_MESSAGE
         return
@@ -1113,7 +1151,6 @@ def receive_mesh(header, binary):
                 obj.shape_key_clear()
             mesh.clear_geometry()
 
-        obj.name = header.get("name", obj.name)
         mesh.vertices.add(vertex_count)
         mesh.vertices.foreach_set("co", positions.astype(numpy.float32).ravel())
         mesh.loops.add(int(corner_verts.size))
@@ -1124,6 +1161,8 @@ def receive_mesh(header, binary):
         if groups:
             restore_vertex_groups(obj, groups)
 
+        if created or not preserve_blender_frame(obj):
+            obj.name = header.get("name", obj.name)
         texcoord_count = int(header.get("texcoord_count", 0))
         if texcoord_count:
             texcoords = read_array(binary, header["texcoord_offset"], texcoord_count * 2, "<f4").reshape(-1, 2)
@@ -1207,7 +1246,7 @@ def receive_mesh(header, binary):
             mesh[GEOMETRY_ID] = header["geometry_id"]
             sent_geometry.add(header["geometry_id"])
             remember_delta_cache(mesh) # what arrived is the baseline a Blender stroke diffs against
-        apply_object_state(obj, header)
+        apply_object_state(obj, header, fresh=created)
         dirty_objects.pop(obj.as_pointer(), None)
         resume_stale(mesh_id)
         if not header.get("live_sync", False):
@@ -1239,6 +1278,11 @@ def receive_delta(header, binary):
     if count < 0 or int(header.get("binary_size", -1)) != len(binary):
         raise ValueError("Invalid mesh delta")
     mesh = obj.data
+    # PROTOCOL §7.2: vertex_count is a topology guard. A delta from a remesh (or any
+    # other rebuild) must not paint the vertices of the previous mesh.
+    if "vertex_count" in header and int(header["vertex_count"]) != len(mesh.vertices):
+        connection.send({"type": "request_mesh", "request_id": uuid.uuid4().hex, "link_id": mesh_id})
+        return
     indices = read_array(binary, header["index_offset"], count, "<u4").astype(numpy.intp)
     valid = indices < len(mesh.vertices)
     keys = mesh.shape_keys.key_blocks if mesh.shape_keys else ()
@@ -1453,6 +1497,7 @@ def receive_instance(header):
         return
     undo_pending = True
     obj = find_linked_object(mesh_id)
+    created = obj is None
     if obj is None:
         obj = bpy.data.objects.new(header.get("name", source.name), source.data)
         bpy.context.collection.objects.link(obj)
@@ -1471,7 +1516,7 @@ def receive_instance(header):
         obj[REPEAT_TAG] = True
     elif obj.get(REPEAT_TAG):
         del obj[REPEAT_TAG]
-    apply_object_state(obj, header)
+    apply_object_state(obj, header, fresh=created)
     sent_geometry.add(header.get("geometry_id", ""))
     dirty_objects.pop(obj.as_pointer(), None)
     resume_stale(mesh_id)
@@ -2092,7 +2137,7 @@ def encode_mesh(obj, mesh, live, include_material, replace_topology):
     else:
         delta_cache.pop(header["geometry_id"], None)
 
-    matrix = TO_NOMAD @ authored_world(obj) @ TO_BLENDER  # authored: see object_state
+    matrix = TO_NOMAD @ outgoing_world(obj) @ TO_BLENDER
     if include_material:
         header["material"] = material_settings(
             obj, colors is not None, roughness is not None, metalness is not None
@@ -2229,9 +2274,7 @@ def send_sculpt_delta(obj):
 
 
 def object_state(obj):
-    # authored, not evaluated: matrix_world lags pair-applied transforms until the next
-    # depsgraph pass, and a same-tick echo would send identity matrices back to Nomad
-    matrix = TO_NOMAD @ authored_world(obj)
+    matrix = TO_NOMAD @ outgoing_world(obj)
     if obj.type == "MESH":
         matrix = matrix @ TO_BLENDER
     parent = link_parent(obj)
@@ -2264,6 +2307,7 @@ def receive_group(header):
     undo_pending = True
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
+    created = obj is None
     if obj is None:
         obj = bpy.data.objects.new(header.get("name", "Nomad Group"), None)
         bpy.context.collection.objects.link(obj)
@@ -2275,7 +2319,7 @@ def receive_group(header):
         # a repeater's group: fully editable (moving it moves the whole array), the
         # display type only tells it apart from a plain Nomad group
         obj.empty_display_type = "ARROWS"
-    apply_object_state(obj, header)
+    apply_object_state(obj, header, fresh=created)
 
 
 def send_object_state(obj):
@@ -2354,7 +2398,7 @@ def send_light(obj, live=False):
 
 def camera_settings(obj):
     data = obj.data
-    world = authored_world(obj)  # authored: see object_state
+    world = outgoing_world(obj)
     return {
         "orthographic": data.type == "ORTHO",
         "fov_y": math.degrees(data.angle_y),
@@ -2419,11 +2463,18 @@ def replace_scene_objects(scene):
         resume_stale(mesh_id)  # the removed objects take their paused message with them
     delta_cache.clear()
     deferred_parents.clear()
+    fresh_links.clear()
     sent_geometry.clear()
     force_full_ids.clear()
 
 
-def apply_object_state(obj, header):
+def apply_object_state(obj, header, fresh=False):
+    if not fresh and preserve_blender_frame(obj):
+        # Placement, parent, name, visibility and the selection lock stay as Blender has them.
+        # Geometry, materials and deletion are applied by their own receivers.
+        deferred_parents.pop(obj.get(MESH_ID, ""), None)
+        remember_object(obj)
+        return
     obj.name = header.get("name", obj.name)
     if "visible" in header:
         visible = bool(header["visible"])
@@ -2439,7 +2490,7 @@ def apply_object_state(obj, header):
     if "visible" in header or "locked" in header:
         visibility_states[obj.as_pointer()] = (obj.visible_get(), obj.hide_select)  # do not echo the applied state
     if "world_matrix" in header:
-        apply_object_transform(obj, header)
+        apply_object_transform(obj, header, fresh)
     remember_object(obj)
 
 
@@ -2780,6 +2831,7 @@ def apply_camera_properties(obj, header):
 def receive_light(header):
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
+    created = obj is None
     if obj is None:
         data = bpy.data.lights.new(header.get("name", "Nomad Light"), "POINT")
         obj = bpy.data.objects.new(header.get("name", "Nomad Light"), data)
@@ -2789,12 +2841,13 @@ def receive_light(header):
         raise ValueError("Linked object is not a light")
     show_scene_shading("use_scene_lights")
     apply_light_properties(obj, header)
-    apply_object_state(obj, header)
+    apply_object_state(obj, header, fresh=created)
 
 
 def receive_camera_object(header):
     link_id = header.get("link_id", "")
     obj = find_linked_object(link_id)
+    created = obj is None
     if obj is None:
         data = bpy.data.cameras.new(header.get("name", "Nomad Camera"))
         obj = bpy.data.objects.new(header.get("name", "Nomad Camera"), data)
@@ -2803,7 +2856,7 @@ def receive_camera_object(header):
     if obj.type != "CAMERA":
         raise ValueError("Linked object is not a camera")
     apply_camera_properties(obj, header)
-    apply_object_state(obj, header)
+    apply_object_state(obj, header, fresh=created)
 
 
 def receive_delete(header):
@@ -2836,12 +2889,14 @@ def receive_delete(header):
         known_objects.pop(node.as_pointer(), None)
         dirty_objects.pop(node.as_pointer(), None)
         deferred_parents.pop(node_id, None)
+        fresh_links.discard(node_id)
         resume_stale(node_id)
         bpy.data.objects.remove(node, do_unlink=True)
 
 
 def version_tuple(version):
-    return tuple(int(value) for value in version.split("."))
+    # "0.11.47-dev.2" compares as 0.11.47. The suffix marks this fork, not the protocol.
+    return tuple(int(value) for value in str(version).split("-", 1)[0].split("."))
 
 
 def linked_object_count(scene):
@@ -3014,6 +3069,7 @@ def receive_packet(header, binary):
         session_source = ""
         delta_cache.clear()
         deferred_parents.clear()
+        fresh_links.clear()
         force_full_ids.clear()
         sent_geometry.clear()
         texture_requested.clear()
@@ -3610,6 +3666,7 @@ def reset_link_state():
     pending_transfers.clear()
     delta_cache.clear()
     deferred_parents.clear()
+    fresh_links.clear()
     deferred_packets.clear()
     deferred_camera = None
     remote_capabilities.clear()
@@ -3826,6 +3883,10 @@ class NOMAD_PT_link(bpy.types.Panel):
             live.label(text="Use Send or Get once to link existing objects", icon="INFO")
 
         layout.prop(scene, "nomad_link_send_modifiers")
+        if context.object is not None:
+            layout.prop(context.object, "nomad_link_preserve_transform")
+            if preserve_blender_frame(context.object):
+                layout.label(text="Placement and visibility stay in Blender", icon="LOCKED")
         layout.prop(scene, "nomad_link_auto_update")
         for scope, label, _description in SCOPE_ITEMS:
             count = len(scope_objects(scene, scope))
@@ -4531,6 +4592,17 @@ classes = (
 
 def register():
     print(f"Nomad Blender Link {VERSION} · build {BUILD}", flush=True)
+    bpy.types.Object.nomad_link_preserve_transform = bpy.props.BoolProperty(
+        name="Keep Blender Placement",
+        description=(
+            "Keep this object's Blender transform, parent, name, visibility and selection "
+            "lock when a Nomad update arrives. Parents are held too, so a remote group "
+            "cannot drag it. Sends the constraint-evaluated world matrix. An object created "
+            "by the receive still takes Nomad's placement once, so Get does not leave it at "
+            "the world origin. Geometry, materials and deletion still sync"
+        ),
+        default=False,
+    )
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_import_nom)
@@ -4612,6 +4684,7 @@ def unregister():
         if undo_redo_post in handlers:
             handlers.remove(undo_redo_post)
     del bpy.types.Scene.nomad_link_auto_update
+    del bpy.types.Object.nomad_link_preserve_transform
     del bpy.types.Scene.nomad_link_sync_shading
     del bpy.types.Scene.nomad_link_sync_cameras
     del bpy.types.Scene.nomad_link_sync_lights
